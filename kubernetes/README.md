@@ -1,9 +1,9 @@
-##Kubernetes
+## Kubernetes
 
-###Working list:
+### Working list:
 
-#####TODO
+##### TODO
 - [kubernetes hard way](https://github.com/kelseyhightower/kubernetes-the-hard-way)
 
 
-#####Done
+##### Done
