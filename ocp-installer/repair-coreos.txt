@@ -1,0 +1,24 @@
+from Jun Tan (IBM) to Everyone:    10:20  PM
+https://access.redhat.com/solutions/9541
+from Jun Tan (IBM) to Everyone:    10:34  PM
+ignition
+from Jun Tan (IBM) to Everyone:    10:35  PM
+journalctl -xn
+from Jun Tan (IBM) to Everyone:    10:35  PM
+cat /proc/partions
+from Jun Tan (IBM) to Everyone:    10:35  PM
+cat /proc/partitions
+from Jun Tan (IBM) to Everyone:    10:35  PM
+cat /proc/partitions
+from Jun Tan (IBM) to Everyone:    10:36  PM
+lsblk
+from Jun Tan (IBM) to Everyone:    10:37  PM
+mount /dev/sda4 /mnt
+from Jun Tan (IBM) to Everyone:    10:38  PM
+mount /dev/sda4 /tmp
+from Jun Tan (IBM) to Everyone:    10:38  PM
+xfs_repair /dev/sda4
+from Jun Tan (IBM) to Everyone:    10:40  PM
+xfs_repair -L /dev/sda4
+from Jun Tan (IBM) to Everyone:    10:41  PM
+exit

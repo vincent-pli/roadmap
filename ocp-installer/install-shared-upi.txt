@@ -1,0 +1,1145 @@
+bastion.ocp.example.com
+==================
+timedatectl list-timezones | grep Shanghai
+timedatectl set-timezone Asia/Shanghai
+timedatectl
+
+yum -y install dnsmasq vim
+
+vim /etc/hosts
+--------------
+192.168.2.201 dns.ocp.example.com
+192.168.2.201 nfs.ocp.example.com
+192.168.2.201 bastion.ocp.example.com
+192.168.2.201 registry.ocp.example.com
+192.168.2.201 lb.ocp.example.com
+192.168.2.201 api.ocp.example.com
+192.168.2.201 api-int.ocp.example.com
+192.168.2.202 bootstrap.ocp.example.com
+192.168.2.203 master0.ocp.example.com etcd-0.ocp.example.com
+192.168.2.204 master1.ocp.example.com etcd-1.ocp.example.com
+192.168.2.205 master2.ocp.example.com etcd-2.ocp.example.com
+192.168.2.206 worker1.ocp.example.com
+192.168.2.207 worker2.ocp.example.com
+192.168.2.208 worker3.ocp.example.com
+127.0.0.1 quay.io
+
+vim /etc/dnsmasq.d/ocp.conf
+----------------------------
+address=/.apps.ocp.example.com/192.168.2.201
+
+vim /etc/dnsmasq.conf
+----------------------------
+dns-loop-detect
+
+---
+firewall-cmd --add-port=53/tcp --permanent
+firewall-cmd --add-port=53/udp --permanent
+firewall-cmd --reload
+
+systemctl enable dnsmasq
+systemctl restart dnsmasq
+systemctl status dnsmasq
+## Make sure resolver.conf has local ip as resolver and remove other resolvers
+## Add lines listen-address=::1,127.0.0.1, local_ip to /etc/dnsmasq.conf 
+## test if config works with: dnsmasq --test
+## https://www.tecmint.com/setup-a-dns-dhcp-server-using-dnsmasq-on-centos-rhel/
+
+
+LB
+---
+yum -y install haproxy net-tools
+setsebool -P haproxy_connect_any=1
+
+vim /etc/haproxy/haproxy.cfg
+----------------------------
+defaults
+  maxconn 20000
+  mode    tcp
+  log     /var/run/haproxy/haproxy-log.sock local0
+  option  dontlognull
+  retries 3
+  timeout http-request 10s
+  timeout queue        1m
+  timeout connect      10s
+  timeout client       86400s
+  timeout server       86400s
+  timeout tunnel       86400s
+
+listen stats
+    bind :9000
+    mode http
+    stats enable
+    stats uri /
+    monitor-uri /healthz
+
+frontend api-server
+    bind *:6443
+    default_backend api-server
+
+backend api-server
+    option  httpchk GET /readyz HTTP/1.0
+    option  log-health-checks
+    balance roundrobin
+    server bootstrap 192.168.2.202:6443 weight 1 verify none check check-ssl inter 1s fall 2 rise 3
+    server master0 192.168.2.203:6443 weight 1 verify none check check-ssl inter 1s fall 2 rise 3
+    server master1 192.168.2.204:6443 weight 1 verify none check check-ssl inter 1s fall 2 rise 3
+    server master2 192.168.2.205:6443 weight 1 verify none check check-ssl inter 1s fall 2 rise 3
+
+frontend machine-config-server
+    bind *:22623
+    default_backend machine-config-server
+
+backend machine-config-server
+    balance roundrobin
+    server bootstrap 192.168.2.202:22623 check
+    server master0 192.168.2.203:22623 check
+    server master1 192.168.2.204:22623 check
+    server master2 192.168.2.205:22623 check
+
+frontend router-http
+    bind *:80
+    default_backend router-http
+
+backend router-http
+    balance source
+    mode tcp
+    server worker1 192.168.2.206:80 check
+    server worker2 192.168.2.207:80 check
+
+frontend router-https
+    bind *:443
+    default_backend router-https
+
+backend router-https
+    balance source
+    mode tcp
+    server worker1 192.168.2.206:443 check
+    server worker2 192.168.2.207:443 check
+
+---
+#If more than one haproxy, please verify the selinux optioin
+systemctl restart haproxy
+systemctl enable haproxy
+systemctl status haproxy
+
+firewall-cmd --add-port=9000/tcp --permanent
+firewall-cmd --add-port=6443/tcp --permanent
+firewall-cmd --add-port=22623/tcp --permanent
+firewall-cmd --add-port=80/tcp --permanent
+firewall-cmd --add-port=443/tcp --permanent
+firewall-cmd --reload
+
+---
+http://lb.ocp.example.com:9000/
+
+
+
+registry
+--------
+yum -y install podman httpd-tools docker-distribution
+
+mkdir -p /opt/registry/{auth,certs,data}
+
+cd /opt/registry/certs
+
+
+CNAME_CA=ca.ocp.example.com
+CER_ROOT_CA=myrootCA
+
+openssl genrsa -out ${CER_ROOT_CA}.key 4096
+
+openssl req -x509 -new -nodes -sha512 -days 3650 \
+ -subj "/C=CN/ST=Beijing/L=Beijing/O=REDHAT/OU=SA/CN=${CNAME_CA}" \
+ -key ${CER_ROOT_CA}.key \
+ -out ${CER_ROOT_CA}.crt
+
+CER_NAME=registry.ocp.example.com
+
+openssl genrsa -out ${CER_NAME}.key 4096
+
+openssl req -sha512 -new \
+    -subj "/C=CN/ST=Beijing/L=Beijing/O=REDHAT/OU=SA/CN=local.registry.com" \
+    -key ${CER_NAME}.key \
+    -out ${CER_NAME}.csr
+
+cat > registry.cnf << EOF
+[req]
+req_extensions = v3_req
+distinguished_name = req_distinguished_name
+
+[req_distinguished_name]
+[ v3_req ]
+basicConstraints = CA:FALSE
+keyUsage = nonRepudiation, digitalSignature, keyEncipherment
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = registry.ocp.example.com
+DNS.2 = registry
+EOF
+
+openssl x509 -req -in ${CER_NAME}.csr -CA ${CER_ROOT_CA}.crt \
+   -CAkey ${CER_ROOT_CA}.key -CAcreateserial -out ${CER_NAME}.crt \
+   -days 3650 -extensions v3_req -extfile registry.cnf
+
+cp /opt/registry/certs/myrootCA.crt /etc/pki/ca-trust/source/anchors/
+update-ca-trust
+
+htpasswd -bBc /opt/registry/auth/htpasswd root password
+
+#podman pull docker.io/library/registry:2
+#
+#vim /etc/systemd/system/mirror-registry.service
+#------
+#[Unit]
+#Description=Mirror Registry Service
+#After=network.target
+#After=network-online.target
+#
+#[Service]
+#Type=simple
+#ExecStart=/usr/bin/podman run --rm --name mirror-registry -p 5000:5000 \
+#     -v /opt/registry/data:/var/lib/registry:z \
+#     -v /opt/registry/auth:/opt/registry/auth:z \
+#     -e "REGISTRY_AUTH=htpasswd" \
+#     -e "REGISTRY_AUTH_HTPASSWD_REALM=Registry Realm" \
+#     -e REGISTRY_AUTH_HTPASSWD_PATH=/opt/registry/auth/htpasswd \
+#     -v /opt/registry/certs:/opt/registry/certs:z \
+#     -e REGISTRY_HTTP_TLS_CERTIFICATE=/opt/registry/certs/registry.ocp.example.com.crt \
+#     -e REGISTRY_HTTP_TLS_KEY=/opt/registry/certs/registry.ocp.example.com.key \
+#     docker.io/library/registry:2
+#ExecStop=/usr/bin/podman stop "mirror-registry" 
+#Restart=always
+#
+#[Install]
+#WantedBy=multi-user.target
+#
+#systemctl daemon-reload
+#systemctl enable mirror-registry
+#systemctl restart mirror-registry
+#systemctl status mirror-registry
+
+
+vi /etc/docker-distribution/registry/config.yml
+-----------------------------------------------
+version: 0.1
+log:
+  fields:
+    service: registry
+storage:
+    cache:
+        layerinfo: inmemory
+    filesystem:
+        rootdirectory: /opt/registry/data
+    delete:
+        enabled: true
+http:
+   addr: :5000
+   tls:
+       certificate: /opt/registry/certs/registry.ocp.example.com.crt
+       key: /opt/registry/certs/registry.ocp.example.com.key
+auth:
+  htpasswd:
+    realm: basic-realm
+    path: /opt/registry/auth/htpasswd
+-----------------------------------------------
+firewall-cmd --add-port=5000/tcp --permanent
+firewall-cmd --reload
+
+systemctl daemon-reload
+systemctl enable docker-distribution
+systemctl restart docker-distribution
+systemctl status docker-distribution
+
+curl -u root:password -k https://registry.ocp.example.com:5000/v2/_catalog 
+
+podman login -u root -p password https://registry.ocp.example.com:5000/
+
+echo -n 'root:password' | base64 -w0
+cm9vdDpwYXNzd29yZA==
+
+yum -y install wget
+
+wget https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.7.0/openshift-client-linux-4.7.0.tar.gz
+tar xzvf openshift-client-linux-4.7.0.tar.gz
+mv oc kubectl /usr/local/bin/
+rm README.md openshift-client-linux-4.7.0.tar.gz
+
+oc version
+--
+Client Version: 4.7.0
+
+kubectl version
+--
+Client Version: version.Info{Major:"1", Minor:"20", GitVersion:"v1.20.1-5-g76a04fc", GitCommit:"c66c03f3012a10f16eb86fdce6330433adf6c9ee", GitTreeState:"clean", BuildDate:"2021-02-13T03:54:59Z", GoVersion:"go1.15.5", Compiler:"gc", Platform:"linux/amd64"}
+
+wget https://github.com/stedolan/jq/releases/download/jq-1.6/jq-linux64
+mv jq-linux64 jq
+chmod 755 jq
+mv jq /usr/local/bin/
+
+vim /root/pull-secret.json
+--------------------------
+{
+   "auths":{
+      "cloud.openshift.com":{
+         "auth":"b3BlbnNoaWZ0LXJlbGVhc3UtZGV2K29jbV9hY2Nlc3NfMjBlZTAwM2YyYmU1NGY5ZTkyYTkyMjNjYzI3OGI0ODA6Q0UxMldWOUNQNFRGSkhaR1RLMThTWFlCTE5BNExHTk5TUDFVQkxJTkZBUEtYV0MwTzFYRFU2ODhLREM0V0UwUg==",
+         "email":"guanzefa@qq.com"
+      },
+      "quay.io":{
+         "auth":"b3BlbnNoaWZ0LXJlbGVhc3UtZGV2K29jbV9hY2Nlc3NfMjBlZTAwM2YyYmU1NGY5ZTkyYTkyMjNjYzI3OGI0ODA6Q0UxMldWOUNQNFRGSkhaR1RLMThTWFlCTE5BNExHTk5TUDFVQkxJTkZBUEtYV0MwTzFYRFU2ODhLREM0V0UwUg==",
+         "email":"guanzefa@qq.com"
+      },
+      "registry.connect.redhat.com":{
+         "auth":"fHVoYy1wb29sLWY4ODE4YjA3LTI1ZTItNGJkNy1iMjQ5LWEwMjY0N2U0YzA2ZTpleUpoYkdjaU9pSlNVelV4TWlKOS5leUp6ZFdJaU9pSXhPVGs1T1RkalkySmtaREUwT0dRMFlXWmhPR0V5WVdVeVl6VmpNems1WmlKOS51QTlGMURpQkd1Vy15b0swUkhYa0owY2QyaTVMaDRuQjNuWlVoY1g3WkZkVkFnZXVLekZSSHYxZnlwbTJ1QVp6ZmZwbnRyamtkNHp2bzYyblNLdEpqWmdaTXVlZDlZdzRuRTFQeTlUSVdDUWc2SUNkaW5NWnRVU19HZUFtQUVFZUJLUWZhQnpHa0pEaW2WRVY2b09ubWFBR2MxUlBUc1FvMXNrU3BMSFZ1UUl0V0txUlhubEpjV1lOcGNlRXdKSkNuLXU3MG40Zk1LWWkyU0xrMG9VY0JkUXE3RXBmTlpuekNzUjRXS1ZCVzFhanpRcVVtaDE1aFM0bXlmRlBIZUJZQ01OOUxvazREM1B5aVRBTjZBSlBJb05lQnh0S2M2dUpnQnRycHlrakRDN08yMjBwQTlFZUVfMUtWclNENTJXMEpWelBIbmRlUWU5NUhPY05hOVdnRDljZzViVjJtSG02dnowR3U0LXRIeGxoRzU5SkotRXZJNWdNcklmY1ctNUFaeVVDYmNrSXloUDdCSHY2MnNlOHEwSnRFV3ZzcHlsU1R2UmhLR2RQanQzZHgxblA2c2xVbWx0ek56ZEVsTWZ5dXo3bWxoRmd4QUZ0Rl81NE03amExMXhBTkMtY3o4Y2dKRlJ1TzNsRTlLWnZhWXlObkZhbG1HckpQR0dsNk15RjNrODlmcUJhbE5UeGZMQl83VFdjSFhPaU9hX1hpMHRMRUVlcm4yZHdZOG1md09PckpubUhnb0NRbk5LdWxNN0hGNUxMbGxRdlVkQVNLeDZJYWFRNUg2S1BXQ2k1aXY2bzJVbHlWQnlsZ3RmYzNKLVNZYnRfdEtuSnZBUHlRakFNbXNnd3hvU2pLSUpwU3M1aXZrT2RvVjRHVlc5OThubWFtY09tb2I4ZkFUSQ==",
+         "email":"guanzefa@qq.com"
+      },
+      "registry.redhat.io":{
+         "auth":"fHVoYy1wb29sLWY4ODE4YjA3LTI1ZTItNGJkNy1iMjQ5LWEwMjY0N2U0YzA2ZTpleUpoYkdjaU9pSlNVelV4TWlKOS5leUp6ZFdJaU9pSXhPVGs1T1RkalkySmtaREUwT0dRMFlXWmhPR0V5WVdVeVl6VmpNems1WmlKOS51QTlGMURpQkd1Vy15b0swUkhYa0owY2QyaTVMaDRuQjNuWlVoY1g3WkZkVkFnZXVLekZSSHYxZnlwbTJ1QVp6ZmZwbnRyamtkNHp2bzYyblNLdEpqWmdaTXVlZDlZdzRuRTFQeTlUSVdDUWc2SUNkaW5NWnRVU19HZUFtQUVFZUJLUWZhQnpHa0pEaW1WRVY2b09ubWFBR2MxUlBUc1FvMXNrU3BMSFZ1UUl0V0txUlhubEpjV1lOcGNlRXdKSkNuLXU3MG40Zk1LWWkyU0xrMG9VY0JkUXE3RXBmTlpuekNzUjRXS1ZCVzFhanpRcVVtaDE1aFM0bXlmRlBIZUJZQ01OOUxvazREM1B5aVRBTjZBSlBJb05lQnh0S2M2dUpnQnRycHlrakRDN08yMjBwQTlFZUVfMUtWclNENTJXMEpWelBIbmRlUWU5NUhPY05hOVdnRDljZzViVjJtSG02dnowR3U0LXRIeGxoRzU5SkotRXZJNWdNcklmY1ctNUFaeVVDYmNrSXloUDdCSHY2MnNlOHEwSnRFV3ZzcHlsU1R2UmhLR2RQanQzZHgxblA2c2xVbWx0ek56ZEVsTWZ5dXo3bWxoRmd4QUZ0Rl81NE03amExMXhBTkMtY3o4Y2dKRlJ1TzNsRTlLWnZhWXlObkZhbG1HckpQR0dsNk15RjNrODlmcUJhbE5UeGZMQl83VFdjSFhPaU9hX1hpMHRMRUVlcm4yZHdZOG1md09PckpubUhnb0NRbk5LdWxNN0hGNUxMbGxRdlVkQVNLeDZJYWFRNUg2S1BXQ2k1aXY2bzJVbHlWQnlsZ3RmYzNKLVNZYnRfdEtuSnZBUHlRakFNbXNnd3hvU2pLSUpwU3M1aXZrT2RvVjRHVlc5OThubWFtY09tb2I4ZkFUSQ==",
+         "email":"guanzefa@qq.com"
+      },
+      "registry.ocp.example.com:5000":{
+         "auth":"cm9vdDpwYXNzd29yZA=="
+      }
+   }
+}
+
+export OCP_RELEASE="4.7.0-x86_64"
+export LOCAL_REGISTRY='registry.ocp.example.com:5000' 
+export LOCAL_REPOSITORY='ocp4/openshift4'
+export PRODUCT_REPO='openshift-release-dev'
+export LOCAL_SECRET_JSON='/root/pull-secret.json'
+export RELEASE_NAME="ocp-release"
+export GODEBUG=x509ignoreCN=0
+
+#oc adm -a ${LOCAL_SECRET_JSON} release mirror  --from=quay.io/${PRODUCT_REPO}/${RELEASE_NAME}:${OCP_RELEASE} --to-dir=/opt/mirror_4.6.1
+#oc image mirror -a ${LOCAL_SECRET_JSON} --dir=/opt/mirror_4.6.1 file://openshift/release:4.6.1* ${LOCAL_REGISTRY}/${LOCAL_REPOSITORY}
+
+oc adm -a ${LOCAL_SECRET_JSON} release mirror \
+     --from=quay.io/${PRODUCT_REPO}/${RELEASE_NAME}:${OCP_RELEASE} \
+     --to=${LOCAL_REGISTRY}/${LOCAL_REPOSITORY} \
+     --to-release-image=${LOCAL_REGISTRY}/${LOCAL_REPOSITORY}:${OCP_RELEASE} 
+
+
+--------------------------------------------------------------------------
+info: Mirroring 130 images to registry.ocp.example.com:5000/ocp4/openshift4 ...
+...
+
+
+sha256:286594a73fcc8d6be9933e64b24455e4d0ac1dd90e485ec8ea1927dc77f38f5c registry.ocp.example.com:5000/ocp4/openshift4:4.7.0-x86_64-kube-rbac-proxy
+sha256:7def5045fa042d3b563fafa52b5e87d897e0362314be8f7f56f84c94d2ffd65a registry.ocp.example.com:5000/ocp4/openshift4:4.7.0-x86_64-azure-machine-controllers
+sha256:f5dd204bdc254653e2cff7fc6776fcf0f8e9f15a54a224a2aa8a966bf5a89e0c registry.ocp.example.com:5000/ocp4/openshift4:4.7.0-x86_64-kuryr-controller
+sha256:a42d1895c93e16c68f9147175fcb49716cb8b7f2562a93e5615673606d78941d registry.ocp.example.com:5000/ocp4/openshift4:4.7.0-x86_64-prometheus-node-exporter
+sha256:a32077727aa2ef96a1e2371dbcc53ba06f3d9727e836b72be0f0dd4513937e1e registry.ocp.example.com:5000/ocp4/openshift4:4.7.0-x86_64-machine-os-content
+sha256:878d5f544df7db8b8a0a193031e01058b63166100d12cc47affb3e0de5c8cd6c registry.ocp.example.com:5000/ocp4/openshift4:4.7.0-x86_64-cluster-bootstrap
+sha256:b03831e65f2c83fdf3497aa34d97b80aa78a61b450db1d736483ab27041b7cab registry.ocp.example.com:5000/ocp4/openshift4:4.7.0-x86_64-jenkins-agent-nodejs
+sha256:dcd6a108f3cadfb6dafaae81decfff8a728d37c57229ae26cd25561460c49809 registry.ocp.example.com:5000/ocp4/openshift4:4.7.0-x86_64-cluster-autoscaler
+sha256:019cfb83cbaba44bdae4fd12819bacceae9b562982d6c4b86f7e144c31c441de registry.ocp.example.com:5000/ocp4/openshift4:4.7.0-x86_64-aws-ebs-csi-driver-operator
+sha256:55776c17dc428be018decaaf501802774490647ece82edf66cccd197961a4195 registry.ocp.example.com:5000/ocp4/openshift4:4.7.0-x86_64-gcp-pd-csi-driver
+sha256:782accb14dc82400e97c645a870f46959dd709718bd90e418c17a8a55713dddb registry.ocp.example.com:5000/ocp4/openshift4:4.7.0-x86_64-ironic-ipa-downloader
+sha256:3426b76f85511237b0d634e9346afdf5df8efaa6c039640ce0b6679d0d201165 registry.ocp.example.com:5000/ocp4/openshift4:4.7.0-x86_64-kube-proxy
+sha256:a374ea60852791e199db075925137545ec4b35dcc5ce135d7315a88e2c90f53f registry.ocp.example.com:5000/ocp4/openshift4:4.7.0-x86_64-oauth-server
+info: Mirroring completed in 20m9.4s (5.779MB/s)
+
+Success
+Update image:  registry.ocp.example.com:5000/ocp4/openshift4:4.7.0-x86_64
+Mirror prefix: registry.ocp.example.com:5000/ocp4/openshift4
+Mirror prefix: registry.ocp.example.com:5000/ocp4/openshift4:4.7.0-x86_64
+
+To use the new mirrored repository to install, add the following section to the install-config.yaml:
+
+imageContentSources:
+- mirrors:
+  - registry.ocp.example.com:5000/ocp4/openshift4
+  source: quay.io/openshift-release-dev/ocp-release
+- mirrors:
+  - registry.ocp.example.com:5000/ocp4/openshift4
+  source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+
+
+To use the new mirrored repository for upgrades, use the following to create an ImageContentSourcePolicy:
+
+apiVersion: operator.openshift.io/v1alpha1
+kind: ImageContentSourcePolicy
+metadata:
+  name: example
+spec:
+  repositoryDigestMirrors:
+  - mirrors:
+    - registry.ocp.example.com:5000/ocp4/openshift4
+    source: quay.io/openshift-release-dev/ocp-release
+  - mirrors:
+    - registry.ocp.example.com:5000/ocp4/openshift4
+    source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+----------------------------------------------------------
+
+yum -y install httpd 
+
+vim /etc/httpd/conf/httpd.conf
+------------------------------
+Listen 8080
+
+-----------------------------------------
+cat << EOF > /etc/httpd/conf.d/repos.conf
+Alias /repos "/opt/repos"
+<Directory "/opt/repos">
+  Options +Indexes +FollowSymLinks
+  Require all granted
+</Directory>
+<Location />
+  SetHandler None
+</Location>
+EOF
+
+systemctl enable httpd
+systemctl restart httpd
+systemctl status httpd
+
+firewall-cmd --add-port=8080/tcp --permanent
+firewall-cmd --reload
+
+#oc adm -a ${LOCAL_SECRET_JSON} release extract --command=openshift-install "${LOCAL_REGISTRY}/${LOCAL_REPOSITORY}:${OCP_RELEASE}"
+wget https://mirror.openshift.com/pub/openshift-v4/clients/ocp/4.7.0/openshift-install-linux.tar.gz
+tar xzvf openshift-install-linux.tar.gz
+mv openshift-install /usr/local/bin/
+rm README.md openshift-install-linux.tar.gz 
+
+NTP
+---
+yum -y install chrony
+
+vim /etc/chrony.conf
+--------------------
+allow 192.168.0.0/16
+--------------------
+
+systemctl enable chronyd
+systemctl start chronyd
+systemctl status chronyd
+
+timedatectl status
+timedatectl set-ntp true
+
+chronyc -n sources -v
+
+firewall-cmd --permanent --add-service=ntp
+firewall-cmd --reload
+
+
+filetranspiler
+--------------
+yum -y install git tree
+
+git clone https://github.com/ashcrow/filetranspiler.git
+cd filetranspiler/
+podman build . -t filetranspiler:latest
+
+rhcos
+-----
+cd ~
+wget https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.7/4.7.0/rhcos-4.7.0-x86_64-live.x86_64.iso
+wget https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.7/4.7.0/rhcos-4.7.0-x86_64-metal.x86_64.raw.gz
+wget https://mirror.openshift.com/pub/openshift-v4/dependencies/rhcos/4.7/4.7.0/rhcos-4.7.0-x86_64-live-rootfs.x86_64.img
+mkdir -p /opt/repos/rhcos
+cp rhcos-4.7.0-x86_64-live.x86_64.iso /opt/repos/rhcos/
+cp rhcos-4.7.0-x86_64-metal.x86_64.raw.gz /opt/repos/rhcos/
+cp rhcos-4.7.0-x86_64-live-rootfs.x86_64.img /opt/repos/rhcos/
+
+install
+-------
+ssh-keygen -t rsa -b 4096 -N '' -f ~/.ssh/id_rsa
+eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/id_rsa
+
+mkdir -p /root/ocp-install
+cd /root/ocp-install 
+
+cat /root/.ssh/id_rsa.pub
+cat /opt/registry/certs/myrootCA.crt
+
+vim install-config.yaml
+-----------------------
+apiVersion: v1
+baseDomain: example.com
+compute:
+- hyperthreading: Enabled
+  name: worker
+  replicas: 3
+controlPlane:
+  hyperthreading: Enabled
+  name: master
+  replicas: 3
+metadata:
+  name: ocp
+networking:
+  clusterNetwork:
+  - cidr: 10.128.0.0/14
+    hostPrefix: 23
+  networkType: OpenShiftSDN
+  serviceNetwork:
+  - 172.30.0.0/16
+platform:
+  none: {}
+fips: false
+pullSecret: '{"auths":{"cloud.openshift.com":{"auth":"b3BlbnNoaWZ0LXJlbGVhc3UtZGV2K29jbV9hY2Nlc3NfMjBlZTAwM2YyYmU1NGY5ZTkyYTkyMjNjYzI3OGI0ODA6Q0UxMldWOUNQNFRGSkhaR1RLMThTWFlCTE5BNExHTk5TUDFVQkxJTkZBUEtYV0MwTzFYRFU2ODhLREM0V0UwUg==","email":"guanzefa@qq.com"},"quay.io":{"auth":"b3BlbnNoaWZ0LXJlbGVhc3UtZGV2K29jbV9hY2Nlc3NfMjBlZTAwM2YyYmU1NGY5ZTkyYTkyMjNjYzI3OGI0ODA6Q0UxMldWOUNQNFRGSkhaR1RLMThTWFlCTE5BNExHTk5TUDFVQkxJTkZBUEtYV0MwTzFYRFU2ODhLREM0V0UwUg==","email":"guanzefa@qq.com"},"registry.connect.redhat.com":{"auth":"fHVoYy1wb29sLWY4ODE4YjA3LTI1ZTItNGJkNy1iMjQ5LWEwMjY0N2U0YzA2ZTpleUpoYkdjaU9pSlNVelV4TWlKOS5leUp6ZFdJaU9pSXhPVGs1T1RkalkySmtaREUwT0dRMFlXWmhPR0V5WVdVeVl6VmpNems1WmlKOS51QTlGMURpQkd1Vy15b0swUkhYa0owY2QyaTVMaDRuQjNuWlVoY1g3WkZkVkFnZXVLekZSSHYxZnlwbTJ1QVp6ZmZwbnRyamtkNHp2bzYyblNLdEpqWmdaTXVlZDlZdzRuRTFQeTlUSVdDUWc2SUNkaW5NWnRVU19HZUFtQUVFZUJLUWZhQnpHa0pEaW1WRVY2b09ubWFBR2MxUlBUc1FvMXNrU3BMSFZ1UUl0V0txUlhubEpjV1lOcGNlRXdKSkNuLXU3MG40Zk1LWWkyU0xrMG9VY0JkUXE3RXBmTlpuekNzUjRXS1ZCVzFhanpRcVVtaDE1aFM0bXlmRlBIZUJZQ01OOUxvazREM1B5aVRBTjZBSlBJb05lQnh0S2M2dUpnQnRycHlrakRDN08yMjBwQTlFZUVfMUtWclNENTJXMEpWelBIbmRlUWU5NUhPY05hOVdnRDljZzViVjJtSG02dnowR3U0LXRIeGxoRzU5SkotRXZJNWdNcklmY1ctNUFaeVVDYmNrSXloUDdCSHY2MnNlOHEwSnRFV3ZzcHlsU1R2UmhLR2RQanQzZHgxblA2c2xVbWx0ek56ZEVsTWZ5dXo3bWxoRmd4QUZ0Rl81NE03amExMXhBTkMtY3o4Y2dKRlJ1TzNsRTlLWnZhWXlObkZhbG1HckpQR0dsNk15RjNrODlmcUJhbE5UeGZMQl83VFdjSFhPaU9hX1hpMHRMRUVlcm4yZHdZOG1md09PckpubUhnb0NRbk5LdWxNN0hGNUxMbGxRdlVkQVNLeDZJYWFRNUg2S1BXQ2k1aXY2bzJVbHlWQnlsZ3RmYzNKLVNZYnRfdEtuSnZBUHlRakFNbXNnd3hvU2pLSUpwU3M1aXZrT2RvVjRHVlc5OThubWFtY09tb2I4ZkFUSQ==","email":"guanzefa@qq.com"},"registry.redhat.io":{"auth":"fHVoYy1wb29sLWY4ODE4YjA3LTI1ZTItNGJkNy1iMjQ5LWEwMjY0N2U0YzA2ZTpleUpoYkdjaU9pSlNVelV4TWlKOS5leUp6ZFdJaU9pSXhPVGs1T1RkalkySmtaREUwT0dRMFlXWmhPR0V5WVdVeVl6VmpNems1WmlKOS51QTlGMURpQkd1Vy15b0swUkhYa0owY2QyaTVMaDRuQjNuWlVoY1g3WkZkVkFnZXVLekZSSHYxZnlwbTJ1QVp6ZmZwbnRyamtkNHp2bzYyblNLdEpqWmdaTXVlZDlZdzRuRTFQeTlUSVdDUWc2SUNkaW5NWnRVU19HZUFtQUVFZUJLUWZhQnpHa0pEaW1WRVY2b09ubWFBR2MxUlBUc1FvMXNrU3BMSFZ1UUl0V0txUlhubEpjV1lOcGNlRXdKSkNuLXU3MG40Zk1LWWkyU0xrMG9VY0JkUXE3RXBmTlpuekNzUjRXS1ZCVzFhanpRcVVtaDE1aFM0bXlmRlBIZUJZQ01OOUxvazREM1B5aVRBTjZBSlBJb05lQnh0S2M2dUpnQnRycHlrakRDN08yMjBwQTlFZUVfMUtWclNENTJXMEpWelBIbmRlUWU5NUhPY05hOVdnRDljZzViVjJtSG02dnowR3U0LXRIeGxoRzU5SkotRXZJNWdNcklmY1ctNUFaeVVDYmNrSXloUDdCSHY2MnNlOHEwSnRFV3ZzcHlsU1R2UmhLR2RQanQzZHgxblA2c2xVbWx0ek56ZEVsTWZ5dXo3bWxoRmd4QUZ0Rl81NE03amExMXhBTkMtY3o4Y2dKRlJ1TzNsRTlLWnZhWXlObkZhbG1HckpQR0dsNk15RjNrODlmcUJhbE5UeGZMQl83VFdjSFhPaU9hX1hpMHRMRUVlcm4yZHdZOG1md09PckpubUhnb0NRbk5LdWxNN0hGNUxMbGxRdlVkQVNLeDZJYWFRNUg2S1BXQ2k1aXY2bzJVbHlWQnlsZ3RmYzNKLVNZYnRfdEtuSnZBUHlRakFNbXNnd3hvU2pLSUpwU3M1aXZrT2RvVjRHVlc5OThubWFtY09tb2I4ZkFUSQ==","email":"guanzefa@qq.com"},"registry.ocp.example.com:5000": {"auth": "cm9vdDpwYXNzd29yZA=="}}}' 
+sshKey: 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC9yf7ffYXpmCMZ24FH3Sn6ZP7v3IqVcx16lyLJ9LeF1qrLJw8Ztk7ClgYjZcE9jMFseYXkfbqNmC8rFSmpMiq4Z6HHmVKCIpzoslgqVpoRlSIW2/eGd0FPv32A6vBTz0QnyjOPIkYnLAhntHNxtPK/1tWsCbFTzSHSATkXxBc4sdiEemC0j9bZbpo0pl46JExI+nKxGcqWM4+QL1t4REnP4WRoiLsFgwDtsi9eouyl14w1NhM3ptQjVw+q5mAHPd+d7T905vceAsuxgvX0rJC/wPbWcxIkuuLvj6yAhR0ngGy1uyHes8CiakOOEGEv9KSisaMiqXh9zeyfTrEFj4XsXGtVSBw8/JRe7fo33t9DI4mZa2ibP/zTdnwmjTnH9eQjbq+TElO8/CTQ5cpLH+KjP2W7f1rOCVrA5MCs8WteZgasjNcSJgJVCQuxykpvfqvaEKz/ixFGktX72xtx+v/gkOeOMllPg+7NMAeXzRg6Wc6vMjhk/n/Gy7nFmuV5/hrrCP1nCed75kOu18rIIa0dQcYn8m1hHuoEFs8rg3IsvxmIed0ZqU2XZ1ZVmh3q1azGDqtnmKby915gQT2mR6J5fMKs0hDMpwhuZkJs5BLE863Dh0LGXymjMrMC3mn5d1NjxO+JQq89Fq8xjBknirGAQo6OrAgIr4Eqq516CBBiAw== root@bastion.ocp.example.com'
+additionalTrustBundle: |
+  -----BEGIN CERTIFICATE-----
+  MIIFqzCCA5OgAwIBAgIJALO2UZ9HwldeMA0GCSqGSIb3DQEBDQUAMGwxCzAJBgNV
+  BAYTAkNOMRAwDgYDVQQIDAdCZWlqaW5nMRAwDgYDVQQHDAdCZWlqaW5nMQ8wDQYD
+  VQQKDAZSRURIQVQxCzAJBgNVBAsMAlNBMRswGQYDVQQDDBJjYS5vY3AuZXhhbXBs
+  ZS5jb20wHhcNMjEwMjI4MDcxODI4WhcNMzEwMjI2MDcxODI4WjBsMQswCQYDVQQG
+  EwJDTjEQMA4GA1UECAwHQmVpamluZzEQMA4GA1UEBwwHQmVpamluZzEPMA0GA1UE
+  CgwGUkVESEFUMQswCQYDVQQLDAJTQTEbMBkGA1UEAwwSY2Eub2NwLmV4YW1wbGUu
+  Y29tMIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAxX7aUE44wi4p1+Ig
+  h2iWky3qbdjF9ofGdPK3V+7ly5wd5qWDoi/HheEUdmAS5ZRqcMqpNg2xJdoinW3n
+  0b30R0KaZhAmHfgbRz1U838jSeTXkoU4J7o6eO06pjEgy8oVj5JYMComPohii6Gb
+  04xYYMLwwPfE4AF3zPusNPuhpKJQT8stWzwrNz0APlen+y7ZkSDO0dcRA/MoJKHn
+  9BDhZ+DCKnUBs0ERORvga9lh1gC1swbTLtric0w/bMrpf8Wg79RGjXC+JsiJXDhx
+  jQz66lSkyrzeJz9thMScv1h/dCwhrJKjKKUyWD0XbdKhcQHFLejRH52flu4eO3wL
+  gRlt4hgPxpxvgoq5Td6DNXMbJR67lYGGScjsD7fTeB2SJzrVyqjSmA/pSFGAHHKx
+  KM2v2DBQsgwVzZr3xmGGACm6r2BRQanPc4ZkABadjYRV+1mOVP2S6ValC/hWqiqU
+  769AEQM79HX7KUmrb0Yp9dq60gR62bVvdd4iTTFZq6AkmM8B8o50vinYkrpjhK4m
+  QIi++PqoAm3wuSAVOBrFBjMgjosSlNabbpSvRSHDtNhrTCJoGMOX+OJZV5xRY6eU
+  b3ptPvZlkdmaYLAwrOVzx7+1GOkqmbCTnlCVqwM/wl1iggIcVJoRH1vnZGkiVo9X
+  vpA0Ym//G53PsNd6/qaX3aRKPOcCAwEAAaNQME4wHQYDVR0OBBYEFKiIfH9zyzjd
+  IqfAXc+WvL4zyppcMB8GA1UdIwQYMBaAFKiIfH9zyzjdIqfAXc+WvL4zyppcMAwG
+  A1UdEwQFMAMBAf8wDQYJKoZIhvcNAQENBQADggIBAIIZTT/mbACfeKA7Vt8rtqKD
+  1e72/cHXiTPn7rSZHxO3quNHo3ZWQtUewjVujl8tY+KVLNKOaAQ2PPrV3K9WlV8o
+  wqqPJVqItdK+wV37x92VXMvwwc1NnsjvhdFtZSiNrblX2PSmxS5E+k22IhN9Qy+A
+  Y9gKgNljKFhdT4Ks9GB7ftJ6fj+rLJoInLnNmIQf+2cdznwqypgVXLrROP/thiNY
+  1btWwdz+xrpHesDequxXP4tpAM5rSW4WcsUpnaBnZpDN/S8wzXaNFCxmYtIpSnYb
+  UDKfPzT04oLSx82BB6RH41VORRAziqJ1bINsor/uhwstHPESREkuOvAwIDVH2h5i
+  l8wmKNHQX2NjQggVoiXAJ8q4zr5kunmiJU0EnXl1buJF20i5YD2AZzljv3efz3sL
+  HZAf7DbkEGZfD8WEXEC8j2BzaYcD1dAjRauUFbrPvs37u8z7RFKjGpZdhmEuv4ip
+  ZtWbkPa4etLc1EGswuZsmtPTXd4ERhQnC+WuBpIMVkqF5SmRKUHxgyOH2Cr/mUzT
+  g6S+21LBA93qdrDHwx6hFC5VR6IlaR06cDXmVqYWXUgkVWSwx+/wc/LYx6AeRkO0
+  BzUAv8HodHoW+XfSpxfbv5dpql8N2mhi7XpLRN9aQmdwOMbzcSbAyc8OdfFFKpye
+  Ug+hMIjtTSkdaHsWqk7q
+  -----END CERTIFICATE-----
+imageContentSources:
+- mirrors:
+  - registry.ocp.example.com:5000/ocp4/openshift4
+  source: quay.io/openshift-release-dev/ocp-release
+- mirrors:
+  - registry.ocp.example.com:5000/ocp4/openshift4
+  source: quay.io/openshift-release-dev/ocp-v4.0-art-dev
+
+
+chrony.conf
+----------------------------------------------
+cat <<EOF > chrony.conf
+server ntp.aliyun.com minpoll 4 maxpoll 10 iburst
+stratumweight 0s
+driftfile /var/lib/chrony/drift
+rtcsync
+makestep 10 3
+local stratum 10
+bindcmdaddress 0.0.0.0
+keyfile /etc/chrony.keys
+noclientlog
+logchange 0.5
+stratumweight 0.05
+logdir /var/log/chrony
+EOF
+
+cp install-config.yaml install-config.yaml.bak
+
+openshift-install create manifests --dir=/root/ocp-install
+cat manifests/cluster-scheduler-02-config.yml
+-----
+apiVersion: config.openshift.io/v1
+kind: Scheduler
+metadata:
+  creationTimestamp: null
+  name: cluster
+spec:
+  mastersSchedulable: False
+  policy:
+    name: ""
+status: {}
+-----
+
+openshift-install create ignition-configs --dir=/root/ocp-install
+tree .
+
+mkdir -p /root/ocp-install/bootstrap/etc/
+cp chrony.conf bootstrap/etc/
+mv bootstrap.ign bootstrap.ign.bak
+podman run -it --rm --volume `pwd`:/srv:z localhost/filetranspiler:latest -i bootstrap.ign.bak -f bootstrap -o bootstrap.ign
+
+mkdir -p /root/ocp-install/master/etc/
+cp chrony.conf master/etc/
+mv master.ign master.ign.bak
+podman run -it --rm --volume `pwd`:/srv:z localhost/filetranspiler:latest -i master.ign.bak -f master -o master.ign
+
+mkdir -p /root/ocp-install/worker/etc/
+cp chrony.conf worker/etc/
+mv worker.ign worker.ign.bak
+podman run -it --rm --volume `pwd`:/srv:z localhost/filetranspiler:latest -i worker.ign.bak -f worker -o worker.ign
+
+tree .
+
+mkdir -p /opt/repos/ignition
+cp bootstrap.ign master.ign worker.ign /opt/repos/ignition/
+
+rhcos startup
+-------------
+
+bootstrap
+---------
+ssh root@192.168.2.202
+yum -y install wget
+wget http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-live.x86_64.iso
+mkdir iso
+mount -o loop rhcos-4.7.0-x86_64-live.x86_64.iso iso/
+cd iso 
+mkdir /tmp/iso
+cp -r * /tmp/iso/
+cd /tmp/iso
+rm ./images/pxeboot/rootfs.img -f
+cp -r * /boot/
+
+cat << EOF > /root/add1.txt
+
+set default="0"
+set timeout=3
+
+EOF
+
+cat << "EOF" > add2.txt
+menuentry 'Re-Install RHEL CoreOS' --class fedora --class gnu-linux --class gnu --class os {
+        linux /images/pxeboot/vmlinuz random.trust_cpu=on rd.luks.options=discard coreos.inst=yes coreos.inst.install_dev=sda coreos.inst.insecure coreos.live.rootfs_url=http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-live-rootfs.x86_64.img coreos.inst.image_url=http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-metal.x86_64.raw.gz coreos.inst.ignition_url=http://192.168.2.201:8080/repos/ignition/bootstrap.ign ip=192.168.2.202::192.168.2.2:255.255.255.0:bootstrap.ocp.example.com:ens33:none nameserver=192.168.2.201
+        initrd /images/pxeboot/initrd.img /images/ignition.img
+}
+EOF
+
+sed -i '68 r /root/add1.txt' /boot/grub2/grub.cfg
+sed -i "91 r /root/add2.txt" /boot/grub2/grub.cfg
+
+reboot
+
+master0
+-------
+ssh root@192.168.2.203
+yum -y install wget
+wget http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-live.x86_64.iso
+mkdir iso
+mount -o loop rhcos-4.7.0-x86_64-live.x86_64.iso iso/
+cd iso 
+mkdir /tmp/iso
+cp -r * /tmp/iso/
+cd /tmp/iso
+rm ./images/pxeboot/rootfs.img -f
+cp -r * /boot/
+
+cat << EOF > /root/add1.txt
+
+set default="0"
+set timeout=3
+
+EOF
+
+cat << "EOF" > /root/add2.txt
+menuentry 'Re-Install RHEL CoreOS' --class fedora --class gnu-linux --class gnu --class os {
+        linux /images/pxeboot/vmlinuz random.trust_cpu=on rd.luks.options=discard coreos.inst=yes coreos.inst.install_dev=sda coreos.inst.insecure coreos.live.rootfs_url=http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-live-rootfs.x86_64.img coreos.inst.image_url=http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-metal.x86_64.raw.gz coreos.inst.ignition_url=http://192.168.2.201:8080/repos/ignition/master.ign ip=192.168.2.203::192.168.2.2:255.255.255.0:master0.ocp.example.com:ens33:none nameserver=192.168.2.201
+        initrd /images/pxeboot/initrd.img /images/ignition.img
+}
+EOF
+
+sed -i '68 r /root/add1.txt' /boot/grub2/grub.cfg
+sed -i "91 r /root/add2.txt" /boot/grub2/grub.cfg
+
+reboot
+
+master1
+-------
+ssh root@192.168.2.204
+yum -y install wget
+wget http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-live.x86_64.iso
+mkdir iso
+mount -o loop rhcos-4.7.0-x86_64-live.x86_64.iso iso/
+cd iso 
+mkdir /tmp/iso
+cp -r * /tmp/iso/
+cd /tmp/iso
+rm ./images/pxeboot/rootfs.img -f
+cp -r * /boot/
+
+cat << EOF > /root/add1.txt
+
+set default="0"
+set timeout=3
+
+EOF
+
+cat << "EOF" > /root/add2.txt
+menuentry 'Re-Install RHEL CoreOS' --class fedora --class gnu-linux --class gnu --class os {
+        linux /images/pxeboot/vmlinuz random.trust_cpu=on rd.luks.options=discard coreos.inst=yes coreos.inst.install_dev=sda coreos.inst.insecure coreos.live.rootfs_url=http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-live-rootfs.x86_64.img coreos.inst.image_url=http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-metal.x86_64.raw.gz coreos.inst.ignition_url=http://192.168.2.201:8080/repos/ignition/master.ign ip=192.168.2.204::192.168.2.2:255.255.255.0:master1.ocp.example.com:ens33:none nameserver=192.168.2.201
+        initrd /images/pxeboot/initrd.img /images/ignition.img
+}
+EOF
+
+sed -i '68 r /root/add1.txt' /boot/grub2/grub.cfg
+sed -i "91 r /root/add2.txt" /boot/grub2/grub.cfg
+
+reboot
+
+master2
+-------
+ssh root@192.168.2.205
+yum -y install wget
+wget http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-live.x86_64.iso
+mkdir iso
+mount -o loop rhcos-4.7.0-x86_64-live.x86_64.iso iso/
+cd iso 
+mkdir /tmp/iso
+cp -r * /tmp/iso/
+cd /tmp/iso
+rm ./images/pxeboot/rootfs.img -f
+cp -r * /boot/
+
+cat << EOF > /root/add1.txt
+
+set default="0"
+set timeout=3
+
+EOF
+
+cat << "EOF" > /root/add2.txt
+menuentry 'Re-Install RHEL CoreOS' --class fedora --class gnu-linux --class gnu --class os {
+        linux /images/pxeboot/vmlinuz random.trust_cpu=on rd.luks.options=discard coreos.inst=yes coreos.inst.install_dev=sda coreos.inst.insecure coreos.live.rootfs_url=http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-live-rootfs.x86_64.img coreos.inst.image_url=http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-metal.x86_64.raw.gz coreos.inst.ignition_url=http://192.168.2.201:8080/repos/ignition/master.ign ip=192.168.2.205::192.168.2.2:255.255.255.0:master2.ocp.example.com:ens33:none nameserver=192.168.2.201
+        initrd /images/pxeboot/initrd.img /images/ignition.img
+}
+EOF
+
+sed -i '68 r /root/add1.txt' /boot/grub2/grub.cfg
+sed -i "91 r /root/add2.txt" /boot/grub2/grub.cfg
+
+reboot
+
+worker1
+-------
+ssh root@192.168.2.206
+yum -y install wget
+wget http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-live.x86_64.iso
+mkdir iso
+mount -o loop rhcos-4.7.0-x86_64-live.x86_64.iso iso/
+cd iso 
+mkdir /tmp/iso
+cp -r * /tmp/iso/
+cd /tmp/iso
+rm ./images/pxeboot/rootfs.img -f
+cp -r * /boot/
+
+cat << EOF > /root/add1.txt
+
+set default="0"
+set timeout=3
+
+EOF
+
+cat << "EOF" > /root/add2.txt
+menuentry 'Re-Install RHEL CoreOS' --class fedora --class gnu-linux --class gnu --class os {
+        linux /images/pxeboot/vmlinuz random.trust_cpu=on rd.luks.options=discard coreos.inst=yes coreos.inst.install_dev=sda coreos.inst.insecure coreos.live.rootfs_url=http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-live-rootfs.x86_64.img coreos.inst.image_url=http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-metal.x86_64.raw.gz coreos.inst.ignition_url=http://192.168.2.201:8080/repos/ignition/worker.ign ip=192.168.2.206::192.168.2.2:255.255.255.0:worker1.ocp.example.com:ens33:none nameserver=192.168.2.201
+        initrd /images/pxeboot/initrd.img /images/ignition.img
+}
+EOF
+
+sed -i '68 r /root/add1.txt' /boot/grub2/grub.cfg
+sed -i "91 r /root/add2.txt" /boot/grub2/grub.cfg
+
+reboot
+
+worker2
+-------
+ssh root@192.168.2.207
+yum -y install wget
+wget http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-live.x86_64.iso
+mkdir iso
+mount -o loop rhcos-4.7.0-x86_64-live.x86_64.iso iso/
+cd iso 
+mkdir /tmp/iso
+cp -r * /tmp/iso/
+cd /tmp/iso
+rm ./images/pxeboot/rootfs.img -f
+cp -r * /boot/
+
+cat << EOF > /root/add1.txt
+
+set default="0"
+set timeout=3
+
+EOF
+
+cat << "EOF" > /root/add2.txt
+menuentry 'Re-Install RHEL CoreOS' --class fedora --class gnu-linux --class gnu --class os {
+        linux /images/pxeboot/vmlinuz random.trust_cpu=on rd.luks.options=discard coreos.inst=yes coreos.inst.install_dev=sda coreos.inst.insecure coreos.live.rootfs_url=http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-live-rootfs.x86_64.img coreos.inst.image_url=http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-metal.x86_64.raw.gz coreos.inst.ignition_url=http://192.168.2.201:8080/repos/ignition/worker.ign ip=192.168.2.207::192.168.2.2:255.255.255.0:worker2.ocp.example.com:ens33:none nameserver=192.168.2.201
+        initrd /images/pxeboot/initrd.img /images/ignition.img
+}
+EOF
+
+sed -i '68 r /root/add1.txt' /boot/grub2/grub.cfg
+sed -i "91 r /root/add2.txt" /boot/grub2/grub.cfg
+
+reboot
+
+worker3
+-------
+ssh root@192.168.2.208
+yum -y install wget
+wget http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-live.x86_64.iso
+mkdir iso
+mount -o loop rhcos-4.7.0-x86_64-live.x86_64.iso iso/
+cd iso 
+mkdir /tmp/iso
+cp -r * /tmp/iso/
+cd /tmp/iso
+rm ./images/pxeboot/rootfs.img -f
+cp -r * /boot/
+
+cat << EOF > /root/add1.txt
+
+set default="0"
+set timeout=3
+
+EOF
+
+cat << "EOF" > /root/add2.txt
+menuentry 'Re-Install RHEL CoreOS' --class fedora --class gnu-linux --class gnu --class os {
+        linux /images/pxeboot/vmlinuz random.trust_cpu=on rd.luks.options=discard coreos.inst=yes coreos.inst.install_dev=sda coreos.inst.insecure coreos.live.rootfs_url=http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-live-rootfs.x86_64.img coreos.inst.image_url=http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-metal.x86_64.raw.gz coreos.inst.ignition_url=http://192.168.2.201:8080/repos/ignition/worker.ign ip=192.168.2.208::192.168.2.2:255.255.255.0:worker3.ocp.example.com:ens33:none nameserver=192.168.2.201
+        initrd /images/pxeboot/initrd.img /images/ignition.img
+}
+EOF
+
+sed -i '68 r /root/add1.txt' /boot/grub2/grub.cfg
+sed -i "91 r /root/add2.txt" /boot/grub2/grub.cfg
+
+reboot
+
+
+wait for bootstrap
+-----------------
+openshift-install --dir=/root/ocp-install  wait-for bootstrap-complete --log-level debug
+---
+DEBUG OpenShift Installer 4.7.0
+DEBUG Built from commit 98e11541c24e95c864328b9b35c64b77836212ed
+INFO Waiting up to 20m0s for the Kubernetes API at https://api.ocp.example.com:6443...
+INFO API v1.20.0+bd9e442 up
+INFO Waiting up to 30m0s for bootstrapping to complete...
+DEBUG Bootstrap status: complete
+INFO It is now safe to remove the bootstrap resources
+INFO Time elapsed: 0s
+---
+
+>>>bootstrap host
+-----------------
+ssh core@bootstrap.ocp.example.com
+journalctl -b -f -u bootkube.service
+---
+xxxxx bootkube.service complete
+---
+
+export KUBECONFIG=/root/ocp-install/auth/kubeconfig
+oc get nodes
+-------------------------------------------------------------------
+NAME                      STATUS   ROLES    AGE     VERSION
+master0.ocp.example.com   Ready    master   30m     v1.20.0+ba45583
+master1.ocp.example.com   Ready    master   27m     v1.20.0+ba45583
+master2.ocp.example.com   Ready    master   27m     v1.20.0+ba45583
+worker1.ocp.example.com   Ready    worker   13m     v1.20.0+ba45583
+worker2.ocp.example.com   Ready    worker   13m     v1.20.0+ba45583
+worker3.ocp.example.com   Ready    worker   8m48s   v1.20.0+ba45583
+
+oc get csr
+oc adm certificate approve xxx
+
+openshift-install --dir=/root/ocp-install wait-for install-complete 
+---
+INFO Waiting up to 40m0s for the cluster at https://api.ocp.example.com:6443 to initialize...
+INFO Waiting up to 10m0s for the openshift-console route to be created...
+INFO Install complete!
+INFO To access the cluster as the system:admin user when using 'oc', run 'export KUBECONFIG=/root/ocp-install/auth/kubeconfig'
+INFO Access the OpenShift web-console here: https://console-openshift-console.apps.ocp.example.com
+INFO Login to the console with user: "kubeadmin", and password: "dxIoP-qaXr4-xw8II-S7xPU"
+INFO Time elapsed: 31m21s
+---
+
+oc label node worker1.ocp.example.com node-role.kubernetes.io/infra= --overwrite
+oc label node worker2.ocp.example.com node-role.kubernetes.io/infra= --overwrite
+
+oc patch ingresscontrollers.operator.openshift.io default -n openshift-ingress-operator --type=merge --patch '{"spec":{"nodePlacement":{"nodeSelector":{"matchLabels":{"node-role.kubernetes.io/infra":""}}}}}'
+
+oc get clusterversion
+------------------------------------------------------------------------------
+NAME      VERSION   AVAILABLE   PROGRESSING   SINCE   STATUS
+version   4.7.0     True        False         42s     Cluster version is 4.7.0
+
+oc get co
+------------------------------------------------------------------------------------------------
+NAME                                       VERSION   AVAILABLE   PROGRESSING   DEGRADED   SINCE
+authentication                             4.7.0     True        False         False      67s
+baremetal                                  4.7.0     True        False         False      39m
+cloud-credential                           4.7.0     True        False         False      42m
+cluster-autoscaler                         4.7.0     True        False         False      37m
+config-operator                            4.7.0     True        False         False      38m
+console                                    4.7.0     True        False         False      12m
+csi-snapshot-controller                    4.7.0     True        False         False      7m29s
+dns                                        4.7.0     True        False         False      36m
+etcd                                       4.7.0     True        False         False      36m
+image-registry                             4.7.0     True        False         False      32m
+ingress                                    4.7.0     True        False         False      21m
+insights                                   4.7.0     True        False         False      32m
+kube-apiserver                             4.7.0     True        False         False      35m
+kube-controller-manager                    4.7.0     True        False         False      35m
+kube-scheduler                             4.7.0     True        False         False      35m
+kube-storage-version-migrator              4.7.0     True        False         False      21m
+machine-api                                4.7.0     True        False         False      37m
+machine-approver                           4.7.0     True        False         False      37m
+machine-config                             4.7.0     True        False         False      35m
+marketplace                                4.7.0     True        False         False      6m44s
+monitoring                                 4.7.0     True        False         False      7m7s
+network                                    4.7.0     True        False         False      39m
+node-tuning                                4.7.0     True        False         False      37m
+openshift-apiserver                        4.7.0     True        False         False      14m
+openshift-controller-manager               4.7.0     True        False         False      36m
+openshift-samples                          4.7.0     True        False         False      30m
+operator-lifecycle-manager                 4.7.0     True        False         False      37m
+operator-lifecycle-manager-catalog         4.7.0     True        False         False      37m
+operator-lifecycle-manager-packageserver   4.7.0     True        False         False      2m18s
+service-ca                                 4.7.0     True        False         False      38m
+storage                                    4.7.0     True        False         False      38m
+
+login
+-----
+https://console-openshift-console.apps.ocp.example.com
+kubeadmin
+dxIoP-qaXr4-xw8II-S7xPU
+
+You are logged in as a temporary administrative user. Update the cluster OAuth configuration to allow others to log in.
+
+password
+--------
+htpasswd -b -c /root/htpasswd admin admin
+htpasswd -b /root/htpasswd readonly readonly
+
+oc create secret generic htpass-secret --from-file=htpasswd=/root/htpasswd -n openshift-config
+
+vim htpasswd-cr.yaml
+--------------------
+apiVersion: config.openshift.io/v1
+kind: OAuth
+metadata:
+  name: cluster
+spec:
+  identityProviders:
+  - name: htpasswd_provider 
+    mappingMethod: claim 
+    type: HTPasswd
+    htpasswd:
+      fileData:
+        name: htpass-secret
+
+oc apply -f htpasswd-cr.yaml
+
+oc adm policy add-cluster-role-to-user cluster-admin admin
+oc adm policy add-cluster-role-to-user cluster-reader readonly
+
+verify
+------
+https://console-openshift-console.apps.ocp.example.com
+https://grafana-openshift-monitoring.apps.ocp.example.com
+https://alertmanager-main-openshift-monitoring.apps.ocp.example.com
+https://prometheus-k8s-openshift-monitoring.apps.ocp.example.com
+
+
+nfs
+---
+yum -y install nfs-utils
+
+mkdir -p /opt/nfs
+
+chown -R nfsnobody:nfsnobody /opt/nfs
+
+#setsebool -P nfs_export_all_rw 1
+#setsebool -P virt_use_nfs 1
+#setsebool -P virt_sandbox_use_nfs 1
+
+cat /etc/sysconfig/nfs |grep 'STATD_PORT\|LOCKD_TCPPORT\|LOCKD_UDPPORT'
+----
+#LOCKD_TCPPORT=32803
+#LOCKD_UDPPORT=32769
+#STATD_PORT=662
+
+sed -i '/LOCKD_TCPPORT/s/^#//' /etc/sysconfig/nfs
+sed -i '/LOCKD_UDPPORT/s/^#//' /etc/sysconfig/nfs
+sed -i '/STATD_PORT/s/^#//' /etc/sysconfig/nfs
+
+cat /etc/sysconfig/nfs |grep 'STATD_PORT\|LOCKD_TCPPORT\|LOCKD_UDPPORT'
+---
+LOCKD_TCPPORT=32803
+LOCKD_UDPPORT=32769
+STATD_PORT=662
+
+vim /etc/exports
+------------
+#/opt/nfs *(rw,sync,no_wdelay,no_root_squash,insecure,fsid=0)
+/opt/nfs *(rw,sync,no_root_squash)
+
+systemctl enable nfs-server
+systemctl restart nfs-server
+
+firewall-cmd --add-port=2049/tcp --permanent
+firewall-cmd --add-port=2049/udp --permanent
+firewall-cmd --add-port=111/tcp --permanent
+firewall-cmd --add-port=111/udp --permanent
+firewall-cmd --add-port=20048/tcp --permanent
+firewall-cmd --add-port=20048/udp --permanent
+firewall-cmd --add-port=32769/tcp --permanent
+firewall-cmd --add-port=32769/udp --permanent
+firewall-cmd --add-port=32769/tcp --permanent
+firewall-cmd --add-port=32769/udp --permanent
+firewall-cmd --add-port=662/tcp --permanent
+firewall-cmd --add-port=662/udp --permanent
+firewall-cmd --reload
+
+exportfs -av
+
+oc new-project nfs-provisioner
+oc project nfs-provisioner
+
+vim nfs-provisioner-rbac.yaml
+-----------------------------
+kind: ServiceAccount
+apiVersion: v1
+metadata:
+  name: nfs-client-provisioner
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: nfs-client-provisioner-runner
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: run-nfs-client-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: nfs-client-provisioner
+    namespace: nfs-provisioner
+roleRef:
+  kind: ClusterRole
+  name: nfs-client-provisioner-runner
+  apiGroup: rbac.authorization.k8s.io
+---
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: leader-locking-nfs-client-provisioner
+rules:
+  - apiGroups: [""]
+    resources: ["endpoints"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: leader-locking-nfs-client-provisioner
+subjects:
+  - kind: ServiceAccount
+    name: nfs-client-provisioner
+    namespace: nfs-provisioner
+roleRef:
+  kind: Role
+  name: leader-locking-nfs-client-provisioner
+  apiGroup: rbac.authorization.k8s.io
+
+------
+
+oc apply -f nfs-provisioner-rbac.yaml
+oc adm policy add-scc-to-user hostmount-anyuid system:serviceaccount:nfs-provisioner:nfs-client-provisioner
+
+oc -a /root/pull-secret.json image mirror quay.io/external_storage/nfs-client-provisioner:v3.1.0-k8s1.11 registry.ocp.example.com:5000/external_storage/nfs-client-provisioner:v3.1.0-k8s1.11 
+
+vim nfs-provisioner-deployment.yaml
+-----------------------------------
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: nfs-client-provisioner
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: nfs-client-provisioner
+  template:
+    metadata:
+      labels:
+        app: nfs-client-provisioner
+    spec:
+      serviceAccountName: nfs-client-provisioner
+      containers:
+        - name: nfs-client-provisioner
+          image: registry.ocp.example.com:5000/external_storage/nfs-client-provisioner:v3.1.0-k8s1.11 
+          volumeMounts:
+            - name: nfs-client-root
+              mountPath: /persistentvolumes
+          env:
+            - name: PROVISIONER_NAME
+              value: nfs-storage
+            - name: NFS_SERVER
+              value: nfs.ocp.example.com
+            - name: NFS_PATH
+              value: /opt/nfs
+      volumes:
+        - name: nfs-client-root
+          nfs:
+            server: nfs.ocp.example.com
+            path: /opt/nfs
+
+---
+oc apply -f nfs-provisioner-deployment.yaml -n nfs-provisioner
+
+vim nfs-provisioner-sc.yaml
+---------------------------
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: nfs-storage-provisioner
+provisioner: nfs-storage
+parameters:
+  archiveOnDelete: "false"
+
+oc apply -f nfs-provisioner-sc.yaml
+
+oc annotate storageclass nfs-storage-provisioner storageclass.kubernetes.io/is-default-class="true"
+
+internal registry
+-----------------
+oc patch configs.imageregistry.operator.openshift.io cluster -p '{"spec":{"managementState": "Managed","storage":{"pvc":{"claim":""}}}}' --type=merge
+#oc patch configs.imageregistry.operator.openshift.io cluster -p '{"spec":{"managementState": "Removed"}}' --type=merge
+
+oc get clusteroperator image-registry
+oc get configs.imageregistry.operator.openshift.io cluster -o yaml
+
+
