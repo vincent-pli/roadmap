@@ -742,7 +742,7 @@ EOF
 
 cat << "EOF" > /root/add2.txt
 menuentry 'Re-Install RHEL CoreOS' --class fedora --class gnu-linux --class gnu --class os {
-        linux /images/pxeboot/vmlinuz random.trust_cpu=on rd.luks.options=discard coreos.inst=yes coreos.inst.install_dev=sda coreos.inst.insecure coreos.live.rootfs_url=http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-live-rootfs.x86_64.img coreos.inst.image_url=http://192.168.2.201:8080/repos/rhcos/rhcos-4.7.0-x86_64-metal.x86_64.raw.gz coreos.inst.ignition_url=http://192.168.2.201:8080/repos/ignition/worker.ign ip=192.168.2.206::192.168.2.2:255.255.255.0:worker1.ocp.example.com:ens33:none nameserver=192.168.2.201
+        linux /images/pxeboot/vmlinuz random.trust_cpu=on rd.luks.options=discard coreos.inst=yes coreos.inst.install_dev=sda coreos.inst.insecure coreos.live.rootfs_url=http://72.16.251.44:9080/ocp4-workspace/dependencies/rhcos-live-rootfs.x86_64.img coreos.inst.image_url=http://72.16.251.44:9080/ocp4-workspace/dependencies/rhcos-metal.x86_64.raw.gz coreos.inst.ignition_url=http://72.16.251.44:9080/ocp4-workspace/dependencies/worker.ign ip=172.16.253.108::172.16.255.250:255.255.255.0:worker-4.ocp48.cluster.local.com:ens192:none nameserver=172.16.251.44
         initrd /images/pxeboot/initrd.img /images/ignition.img
 }
 EOF
